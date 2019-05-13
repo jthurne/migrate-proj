@@ -1,0 +1,520 @@
+#!/bin/bash
+// 2>/dev/null; scriptDir="$( cd "$( dirname "$0" )" && pwd )"
+// 2>/dev/null; exec groovy -cp "$scriptDir:$scriptDir/../" "$0" "$@"; exit $?
+// vim: set ft=groovy
+/*
+ * Copyright 2019 James Hurne
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+@Grapes([
+  @Grab(group='org.slf4j', module='slf4j-nop', version='1.7.13'),
+  @Grab(group='org.ajoberstar', module='grgit', version='1.4.1'),
+  @Grab(group='org.fusesource.jansi', module='jansi', version='1.11'),
+  @Grab(group='org.apache.commons', module='commons-exec', version='1.3')
+])
+import org.ajoberstar.grgit.Grgit
+import org.ajoberstar.grgit.exception.GrgitException
+
+import org.fusesource.jansi.AnsiConsole
+import static org.fusesource.jansi.Ansi.*
+import static org.fusesource.jansi.Ansi.Color.*
+import static org.fusesource.jansi.Ansi.Attribute.*
+
+import org.apache.commons.exec.*
+
+import java.io.ByteArrayOutputStream
+
+def cli = new CliBuilder(
+   usage: "${ScriptUtils.getScriptFile().name} [OPTIONS]",
+   header: "\nApplies updates to the current project to bring the project up to the latest level.",
+   footer: "\nSee the README.md found in the same directory as the script for more details.")
+cli.with() {
+  l(longOpt: 'list', 'list all of the known migrations and exit without doing anything')
+  h(longOpt: 'help', 'display command help and exit without doing anything')
+  m(longOpt: 'migration',
+    args:        1,
+    argName:     'MIGRATION',
+    optionalArg: false,
+    'Applies the given MIGRATION regardless of the current migration level and without updating the current level. MIGRATION must be an integer (e.g., 001, 23) and identifies which migration to run.')
+}
+cli._(longOpt: 'verbose'   , 'show verbose output from each migration')
+cli._(longOpt: 'dry-run'   , 'displays the commands that would be run but does not actually execute anything')
+
+def options = cli.parse(args)
+if (options.h) {
+  cli.usage()
+  return
+}
+
+def scriptDir = ScriptUtils.getScriptDir()
+
+def runSpecificMigration = options.m
+def stdOutNotSuppressed = options.'dry-run' || options.'verbose'
+def ui = new UserInterface(stdOutNotSuppressed)
+def repo = createRepo(options.'dry-run')
+def committer = createCommitter(options.'dry-run')
+
+try {
+  if (options.m && !options.m.isInteger()) {
+    ui.invalidMigrationId(options.m)
+    println()
+    cli.usage()
+    committer.close()
+    System.exit(1)
+  }
+
+  def migrations = Migration.loadMigrations(scriptDir, options.'dry-run', options.'verbose')
+
+  if (options.l) {
+    ui.list(migrations)
+    return
+  }
+
+  def migrationsToExec = findMigrationsToRun(migrations, repo, options)
+
+  if (runSpecificMigration && migrationsToExec.isEmpty()) {
+    ui.migrationDoesNotExist(options.m, migrations)
+    committer.close()
+    System.exit(1)
+  }
+
+  if (committer.repoIsDirty()) {
+    ui.repoIsDirty()
+    committer.close()
+    System.exit(2)
+  }
+
+  ui.started(repo, migrations)
+
+  if (migrations.last().level <= repo.level && !runSpecificMigration) {
+    ui.nothingToDo()
+    return
+  }
+
+  migrationsToExec.each { migration ->
+    ui.startedExecuting(migration)
+    def (output, errorMessage, commitMsgProps) = migration.execute()
+
+    if (errorMessage.isEmpty()) {
+      if (migration.level > repo.level && !runSpecificMigration) repo.level = migration.level
+      committer.commit(migration, commitMsgProps, repo)
+      ui.executionFinishedSuccessfully(migration, output)
+    } else {
+      ui.executionFailed(migration, output, errorMessage)
+      committer.close()
+      System.exit(10)
+    }
+  }
+
+  ui.finishedSuccessfully()
+} finally {
+  committer.close()
+}
+
+def createCommitter(boolean isDryRun) {
+  if (isDryRun)
+    new DryCommitter()
+  else
+    new Committer()
+}
+
+def createRepo(boolean isDryRun) {
+  if (isDryRun)
+    new DryRepo()
+  else
+    new Repo()
+}
+
+def findMigrationsToRun(migrations, repo, options) {
+  def runSpecificMigration = options.m
+  if (runSpecificMigration)
+    migrations.findAll { it.level == options.m.toInteger() }
+  else
+    migrations.findAll { it.level > repo.level || it.alwaysRun }
+}
+
+class Migration {
+  private static final String DESCRIPTION_FILE = "description.txt"
+  private static final String SCRIPT_FILE = "do_migration"
+  private static final String MIGRATION_DIR_REGEX = /([0-9]+)-(ALWAYS-)?(.*)/
+  private static final String PROPERTIES_HEADER = '--@Properties@--'
+
+  final int level
+  final String name
+  final String description
+  final File script
+  final boolean alwaysRun
+  final boolean suppressStdOut
+
+  public Migration(int level, String name, String description, File script, boolean alwaysRun, boolean suppressStdOut) {
+    this.level = level
+    this.name = name
+    this.description = description
+    this.script = script
+    this.alwaysRun = alwaysRun
+    this.suppressStdOut = suppressStdOut
+  }
+
+  String toString() { "Migration($level, $name, $script)" }
+
+  String getPaddedLevel() { level.toString().padLeft(3, "0") }
+
+  // TODO move the responsiblity to execute a migration to a separate class?
+  def execute() {
+    def (output, errorMessage) = cmd(script.absolutePath)
+    def (trimmedOutput, commitMsgProps) = parseProperties(output)
+
+    [trimmedOutput, errorMessage, commitMsgProps]
+  }
+
+  private def cmd(String command) {
+    cmd(CommandLine.parse(command))
+  }
+
+  private def cmd(CommandLine cmdLine) {
+    Executor executor = new DefaultExecutor()
+    executor.setWorkingDirectory(new File('.'))
+
+    def out = new ByteArrayOutputStream()
+
+    executor.setStreamHandler(new PumpStreamHandler(out, System.err, System.in))
+
+    try {
+      executor.execute(cmdLine)
+      [new String(out.toByteArray()), ""]
+    } catch (ExecuteException e) {
+      [new String(out.toByteArray()), e.message]
+    } catch (IOException e) {
+      [new String(out.toByteArray()), stackTraceToString(e)]
+    }
+  }
+
+  private String stackTraceToString(Throwable t) {
+    def writer = new StringWriter()
+    t.printStackTrace(new PrintWriter(writer))
+    writer.toString()
+  }
+
+  private def parseProperties(String output) {
+    def commitMsgProps = new Properties()
+
+    def outputAndProps = output.split(PROPERTIES_HEADER)
+    if (outputAndProps.size() > 1) {
+      def props = outputAndProps[1]
+      commitMsgProps.load(new StringReader(props))
+    }
+
+    [outputAndProps[0], commitMsgProps]
+  }
+
+  static def loadMigrations(File dir, boolean isDryRun, boolean verbose) {
+    def migrations = []
+    dir.eachDirMatch(~MIGRATION_DIR_REGEX) {
+      def migrationMatcher = it.name =~ MIGRATION_DIR_REGEX
+      def level = migrationMatcher[0][1].toInteger()
+      def alwaysRun = migrationMatcher[0][2] != null
+      def name = migrationMatcher[0][3].replaceAll('_'," ")
+      def description = new File(it, DESCRIPTION_FILE).text.trim()
+      def script = new File(it, SCRIPT_FILE)
+
+      def migration = new Migration(level, name, description, script, alwaysRun, !verbose)
+      if (isDryRun) migration = new DryMigration(level, name, description, script, alwaysRun, !verbose)
+
+      migrations.add(migration)
+    }
+
+    migrations.sort { it.level }
+  }
+}
+
+class DryMigration extends Migration {
+  public DryMigration(int level, String name, String description, File script, boolean alwaysRun, boolean suppressStdOut) {
+    super(level, name, description, script, alwaysRun, suppressStdOut)
+  }
+
+  @Override
+  def execute() {
+    println "[DRY RUN] $script.absolutePath"
+    println DryRunUtils.indent(script.text)
+    println()
+    ["", new Properties()]
+  }
+}
+
+class Repo {
+  static String LEVEL_FILE = ".migration-level"
+
+  private File levelFile = new File(LEVEL_FILE)
+
+  int getLevel() {
+    def level = 0
+    if (levelFile.exists())
+      level = levelFile.text.trim().toInteger()
+    level
+  }
+
+  String getPaddedLevel() {
+    level.toString().padLeft(3, "0")
+  }
+
+  void setLevel(int level) {
+    levelFile.text = level.toString().padLeft(3, "0")
+  }
+}
+
+class DryRepo extends Repo {
+  public int level = 0
+
+  public DryRepo() {
+    def levelFile = new File(LEVEL_FILE)
+    if (levelFile.exists())
+      level = levelFile.text.trim().toInteger()
+  }
+
+  int getLevel() { level }
+  void setLevel(int newLevel) { this.level = newLevel }
+}
+
+class Committer {
+  private Grgit gitRepo = Grgit.open(dir: '.')
+
+  boolean repoIsDirty() { !noChangesWereMade() }
+
+  void commit(Migration migration, Properties commitMsgProps, Repo repo) {
+    gitRepo.add(patterns: [Repo.LEVEL_FILE])
+
+    if (noChangesWereMade()) return
+
+    gitRepo.commit(message: createCommitMsg(migration, commitMsgProps, repo), all: true)
+  }
+
+  void close() {
+    gitRepo.close()
+  }
+
+  protected String createCommitMsg(Migration migration, commitMsgProps, Repo repo) {
+    if (onlyRepositoryLevelChanged()) {
+      def summary = "Updates build level to ${repo.paddedLevel}"
+      def description = "${ScriptUtils.getScriptName()} tried to apply migration " +
+        "${migration.paddedLevel} (${migration.name}), but in this " +
+        "case, no changes were made. Thus, this commit only updates the " +
+        "build level."
+
+      """${summary}
+
+${wrap(description, 72)}
+
+This commit was auto-generated by ${ScriptUtils.getScriptName()}.
+"""
+    } else {
+      def engine = new groovy.text.SimpleTemplateEngine()
+      def template = engine.createTemplate(migration.description).make(commitMsgProps)
+      def message = template.toString()
+      def stamp = "This commit was auto-generated by ${ScriptUtils.getScriptName()} by applying migration ${migration.paddedLevel}."
+
+      """${message}
+
+${wrap(stamp, 72)}
+"""
+    }
+  }
+
+  private boolean noChangesWereMade() {
+    def allChanges = getAllChanges()
+    allChanges.size() == 0
+  }
+
+  private boolean onlyRepositoryLevelChanged() {
+    def allChanges = getAllChanges()
+    allChanges.size() == 1 && allChanges.contains(Repo.LEVEL_FILE)
+  }
+
+  private Set<String> getAllChanges() {
+    def status = gitRepo.status()
+    def allChanges = new HashSet<String>()
+    allChanges.addAll(status.staged.added)
+    allChanges.addAll(status.staged.modified)
+    allChanges.addAll(status.staged.removed)
+    // Don't include unstaged added because those will not be committed, and repos often contain unstagged added files
+    allChanges.addAll(status.unstaged.modified)
+    allChanges.addAll(status.unstaged.removed)
+
+    allChanges
+  }
+
+  private String wrap(String input, int maxLength) {
+    def words = input.split(/\s+/)
+    def lines = ['']
+    words.each { word ->
+      def line = "${lines[-1]} $word".trim()
+      if (line.length() > maxLength) {
+        lines << word
+      } else {
+        lines[-1] = line
+      }
+    }
+    lines.join("\n")
+  }
+
+
+}
+
+class DryCommitter extends Committer {
+  @Override
+  void commit(Migration migration, Properties commitMsgProps, Repo repo) {
+    def commitMsg = createCommitMsg(migration, commitMsgProps, repo)
+    println "[DRY RUN] Generated Commit Message:"
+    println()
+    println DryRunUtils.indent(commitMsg)
+  }
+}
+
+class DryRunUtils {
+  static String indent(String text) {
+    "[DRY RUN]  " + text.split("\n").join("\n[DRY RUN]  ")
+  }
+}
+
+class UserInterface {
+
+  final boolean stdOutNotSuppressed
+  final boolean stdOutSuppressed
+
+  public UserInterface(boolean stdOutNotSuppressed) {
+    this.stdOutNotSuppressed = stdOutNotSuppressed
+    this.stdOutSuppressed = !stdOutNotSuppressed
+    AnsiConsole.systemInstall()
+  }
+
+  void started(Repo repo, List<Migration> migrations) {
+    def latestLevel = migrations.last().paddedLevel
+
+    println ansi()
+      .fg(WHITE).a("get ")
+      .bold().a("ready ")
+      .boldOff().a("to ")
+      .fgBright(BLUE).a("M ")
+      .fgBright(RED).a("I ")
+      .fgBright(CYAN).a("G ")
+      .fgBright(MAGENTA).a("R ")
+      .fgBright(GREEN).a("A ")
+      .fgBright(RED).a("T ")
+      .fgBright(BLUE).a("E ")
+      .fgBright(WHITE).a(" !!!")
+      .reset()
+
+     println()
+     println "   repository level...$repo.paddedLevel"
+     println "   latest level.......$latestLevel"
+     println()
+  }
+
+  void migrationDoesNotExist(String migration, List<Migration> migrations) {
+    println ansi().fg(YELLOW).a("Oops! The migration \"$migration\" does not exist.").reset()
+    println()
+    list(migrations)
+  }
+
+  void invalidMigrationId(String migration) {
+    println ansi().fg(YELLOW).a("Oops! \"$migration\" is not an integer. Try specifing the migration to run by its integer identifier.").reset()
+  }
+
+  void repoIsDirty() {
+    println ansi().fg(YELLOW).a("You have uncommitted changes. Please commit or stash any changes you have before running ${ScriptUtils.getScriptName()}.").reset()
+  }
+
+  void nothingToDo() {
+    println ansi().fg(YELLOW).a("Oh snap. Looks like this repo is already at the latest level. Maybe next time.").reset()
+  }
+
+  void list(List<Migration> migrations) {
+    println "Available migrations:"
+    println()
+    migrations.each { migration ->
+      println ansi()
+        .fgBright(BLUE).a("${formatName(migration)}")
+        .reset()
+    }
+  }
+
+  void startedExecuting(Migration migration) {
+    print ansi()
+      .fgBright(BLUE).a("--> ${formatName(migration)}")
+      .fg(YELLOW).a("......")
+      .reset()
+
+    // Have to flush because we want this text to show up while the migration is running
+    // and by default PrintStreams don't flush until a newline is written
+    System.out.flush()
+
+    if(stdOutNotSuppressed) {
+      println()
+      println()
+    }
+  }
+
+  private String formatName(Migration migration) {
+    def alwaysRunMod = ""
+    if (migration.alwaysRun) alwaysRunMod = " (ALWAYS)"
+
+    "${migration.paddedLevel}: ${migration.name}${alwaysRunMod}"
+  }
+
+  void executionFinishedSuccessfully(Migration migration, String migrationOutput) {
+    if (stdOutNotSuppressed) {
+      println indent(migrationOutput)
+      println ansi().fgBright(GREEN).a("--> $migration.paddedLevel DONE").reset()
+      println()
+    } else {
+      println ansi().fgBright(GREEN).a("DONE").reset()
+    }
+  }
+
+  void finishedSuccessfully() {
+    println()
+    println ansi().fgBright(GREEN).a("MIGRATION SUCCESS").reset()
+  }
+
+  void executionFailed(Migration migration, String migrationOutput, String errorMessage) {
+    if (stdOutSuppressed) {
+      println()
+      println()
+    }
+    println indent(migrationOutput)
+    println ansi().fgBright(RED).a(indent(errorMessage)).reset()
+    println()
+    println ansi().fgBright(RED).a("--> $migration.paddedLevel FAILED!").reset()
+    println()
+  }
+
+  private String indent(String content) {
+    def indent = "    "
+    indent + content.replaceAll(/\n/, "\n${indent}")
+  }
+}
+
+
+class ScriptUtils {
+  static File getScriptFile() {
+    new File(ScriptUtils.class.protectionDomain.codeSource.location.path)
+  }
+
+  static String getScriptName() {
+    getScriptFile().name
+  }
+
+  static File getScriptDir() {
+    getScriptFile().parentFile
+  }
+}
