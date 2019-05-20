@@ -59,6 +59,19 @@ To add a new migration:
 That's it! Your new migration will be applied the next time `migrate_proj` is
 run against a project.
 
+### Where to put migrations
+
+By default, migrate_proj looks for migrations in the migrations subdirectory of
+the directory the script lives in. The default migrations directory contains a
+.gitignore file that ignores all files within the directory to prevent
+accidentally pushing a migration up to the project itself. If you want to
+use git to manage your migrations (and you probably do), then you will want to
+change the default location.
+
+You can change the directory migrate_proj looks for migrations in by either setting the
+PROJ_MIGRATIONS_HOME environment variable or by passing the `--migrations-home`
+command line flag.
+
 ### Migration directories
 
 Each migration is stored in a directory with the following naming syntax:

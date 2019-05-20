@@ -48,6 +48,10 @@ cli.with() {
     optionalArg: false,
     'Applies the given MIGRATION regardless of the current migration level and without updating the current level. MIGRATION must be an integer (e.g., 001, 23) and identifies which migration to run.')
 }
+cli._(longOpt: 'migrations-home',
+      args: 1,
+      argName:   'DIR',
+      'the directory to look for migrations in. Defaults to the migrations directory under the directory this script lives in. Can also be overriden by setting the PROJ_MIGRATIONS_HOME environment variable (the command line flag takes priority over the environment variable).')
 cli._(longOpt: 'verbose'   , 'show verbose output from each migration')
 cli._(longOpt: 'dry-run'   , 'displays the commands that would be run but does not actually execute anything')
 
@@ -64,6 +68,7 @@ def stdOutNotSuppressed = options.'dry-run' || options.'verbose'
 def ui = new UserInterface(stdOutNotSuppressed)
 def repo = createRepo(options.'dry-run')
 def committer = createCommitter(options.'dry-run')
+def migrationsHome = options.'migrations-home' ?: System.getenv('PROJ_MIGRATIONS_HOME') ?: new File(scriptDir, "migrations").getAbsolutePath()
 
 try {
   if (options.m && !options.m.isInteger()) {
@@ -74,7 +79,7 @@ try {
     System.exit(1)
   }
 
-  def migrations = Migration.loadMigrations(scriptDir, options.'dry-run', options.'verbose')
+  def migrations = Migration.loadMigrations(new File(migrationsHome), options.'dry-run', options.'verbose')
 
   if (options.l) {
     ui.list(migrations)
